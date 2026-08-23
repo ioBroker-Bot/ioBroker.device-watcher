@@ -95,6 +95,14 @@ class DeviceWatcher extends utils.Adapter {
         // Pending refresh flag (set if refreshData() wurde während main() geblockt)
         this.pendingRefresh = false;
 
+        // Subscribed state/object patterns – verhindert mehrfaches (re-)subscriben in createData(),
+        // welches bei jedem main()-Durchlauf (auch bei Rescans) aufgerufen wird. Erneutes Subscriben
+        // eines bereits abonnierten Patterns löst in ioBroker sofort einen stateChange-Event mit dem
+        // aktuellen Wert aus – ohne Guard führte das zu einer Endlosschleife aus
+        // "Pending rescan detected" beim Start.
+        this.subscribedStatePatterns = new Set();
+        this.subscribedObjectPatterns = new Set();
+
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
         this.on('objectChange', this.onObjectChange.bind(this));
@@ -362,14 +370,18 @@ class DeviceWatcher extends utils.Adapter {
                 // The object was deleted
                 this.log.debug(`object ${id} deleted`);
 
+                let removedSomething = false;
+
                 // delete instance data in map
                 if (this.listInstanceRaw.has(id)) {
                     this.listInstanceRaw.delete(id);
+                    removedSomething = true;
                 }
 
                 // delete device data in map
                 if (this.listAllDevicesRaw.has(id)) {
                     this.listAllDevicesRaw.delete(id);
+                    removedSomething = true;
                 }
                 // also remove all child devices if a parent/adapter object was deleted
                 const idPrefix = `${id}.`;
@@ -377,12 +389,67 @@ class DeviceWatcher extends utils.Adapter {
                     if (key.startsWith(idPrefix)) {
                         this.log.debug(`[onObjectChange] removing child device from map: ${key}`);
                         this.listAllDevicesRaw.delete(key);
+                        removedSomething = true;
                     }
                 }
 
                 //unsubscribe of Objects and states
                 this.unsubscribeForeignObjects(id);
                 this.unsubscribeForeignStates(id);
+
+                // Clear the subscription guard sets too (introduced to prevent the resubscribe
+                // feedback loop), otherwise a device re-added later under the same id would never
+                // get re-subscribed since the guard would still consider it "subscribed".
+                if (this.subscribedStatePatterns) {
+                    for (const pattern of Array.from(this.subscribedStatePatterns)) {
+                        if (pattern === id || pattern.startsWith(idPrefix)) {
+                            this.subscribedStatePatterns.delete(pattern);
+                        }
+                    }
+                }
+                if (this.subscribedObjectPatterns) {
+                    for (const pattern of Array.from(this.subscribedObjectPatterns)) {
+                        if (pattern === id || pattern.startsWith(idPrefix)) {
+                            this.subscribedObjectPatterns.delete(pattern);
+                        }
+                    }
+                }
+
+                // Removing entries from the raw maps only updates our internal state –
+                // without refreshing the derived lists/datapoints (deviceCounter, offlineDevices, ...)
+                // the deletion isn't reflected immediately and only shows up after the next
+                // scheduled refresh/rescan. So trigger the same update path used for dirty states.
+                if (removedSomething) {
+                    this.log.info(`[onObjectChange] Device/instance removed: ${id} – updating lists`);
+
+                    if (this.processingLock) {
+                        this.log.debug(`[onObjectChange] processingLock aktiv – Entfernung von ${id} wird als pendingRescan vorgemerkt`);
+                        this.pendingRescan = true;
+                    } else {
+                        this.processingLock = true;
+                        try {
+                            await crud.createLists(this);
+                            await crud.writeDatapoints(this);
+
+                            if (this.configCreateOwnFolder) {
+                                for (const [adId] of Object.entries(adapterArray)) {
+                                    const adapter = adapterArray[adId];
+                                    if (this.adapterSelected.includes(adapter.adapterKey)) {
+                                        await crud.createLists(this, adId);
+                                        await crud.writeDatapoints(this, adId);
+                                    }
+                                }
+                            }
+                        } finally {
+                            this.processingLock = false;
+                            if (this.pendingRescan) {
+                                this.pendingRescan = false;
+                                this.log.debug(`[onObjectChange] pendingRescan nach Entfernung – starte main()`);
+                                await this.main();
+                            }
+                        }
+                    }
+                }
             } catch (error) {
                 this.log.error(`Issue at object deletion: ${error}`);
             }
