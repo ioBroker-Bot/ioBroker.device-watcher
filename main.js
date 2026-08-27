@@ -304,11 +304,6 @@ class DeviceWatcher extends utils.Adapter {
                     this.log.error(`[main - create and fill datapoints for each adapter] - ${error}`);
                 }
             }
-
-            if (this.pendingRescan) {
-                this.log.info(`[main] Pending rescan detected – Schleife wird wiederholt`);
-            }
-
         } while (this.pendingRescan);
 
         this.processingLock = false;
